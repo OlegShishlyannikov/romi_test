@@ -1,9 +1,13 @@
+#include <arpa/inet.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <linux/in.h>
 #include <string>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -48,17 +52,19 @@ private:
   std::string msg_;
 };
 
-void usage() { std::fprintf(stderr, "Missing parameter(s) -d <serial device file> -b <baudrate>\r\n"); }
+void usage() { std::fprintf(stderr, "Missing parameter(s) -d <serial device file> -b <baudrate> -p <udp_port>\r\n"); }
 
 int32_t main(int32_t argc, char *argv[]) {
   static constexpr auto nstrings = 10u;
   static constexpr auto timeout_val_s = 5u;
-  int32_t rc, sp_fd, baudrate = 0;
+  int32_t rc, sp_fd, baudrate = 0, sock_fd, param = 1;
+  uint16_t udp_port = 0;
   char *serial_dev_file{nullptr};
   struct termios tty;
   char read_buf[256u]{0x00};
+  struct sockaddr_in broadcast_addr;
 
-  while ((rc = ::getopt(argc, argv, "d:b:")) != -1) {
+  while ((rc = ::getopt(argc, argv, "d:b:p:")) != -1) {
     switch (rc) {
     case 'd': {
       serial_dev_file = optarg;
@@ -68,12 +74,16 @@ int32_t main(int32_t argc, char *argv[]) {
       baudrate = std::atoi(optarg);
     } break;
 
+    case 'p': {
+      udp_port = std::atoi(optarg);
+    } break;
+
     default:
       break;
     }
   }
 
-  if (!serial_dev_file || !baudrate) {
+  if (!serial_dev_file || !baudrate || !udp_port) {
     usage();
     goto error;
   }
@@ -143,10 +153,27 @@ int32_t main(int32_t argc, char *argv[]) {
     return 1;
   }
 
+  // Create udp broadcast socket
+  if ((sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    std::fprintf(stderr, "Error socket(): %s (%s:%i)\r\n", ::strerror(errno), __FILE__, __LINE__);
+    goto error;
+  }
+
+  // Create udp broadcast socket
+  if ((rc = ::setsockopt(sock_fd, SOL_SOCKET, SO_BROADCAST, (char *)&param, sizeof(param))) < 0) {
+    std::fprintf(stderr, "Error setsockopt(): %s (%s:%i)\r\n", ::strerror(errno), __FILE__, __LINE__);
+    goto error;
+  }
+
+  std::memset((void *)&broadcast_addr, 0, sizeof(struct sockaddr_in));
+  broadcast_addr.sin_family = AF_INET;
+  broadcast_addr.sin_addr.s_addr = ::htonl(INADDR_BROADCAST);
+  broadcast_addr.sin_port = ::htons(udp_port);
+
   // Try to read
   for (uint32_t i = 0; i < nstrings; i++) {
     if ((rc = ::read(sp_fd, &read_buf, sizeof(read_buf))) < 0) {
-
+      ::close(sp_fd);
       std::fprintf(stderr, "Error read(): %s (%s:%i)\r\n", ::strerror(errno), __FILE__, __LINE__);
       goto error;
     }
@@ -157,7 +184,15 @@ int32_t main(int32_t argc, char *argv[]) {
     if (read_str.length()) {
       // Handle string
       uint8_t *enc_buf = Message(read_str).encrypt(&encrypted_size);
-      std::printf("Read data encoded: %s\r\n", std::string(reinterpret_cast<char *>(enc_buf), encrypted_size).c_str());
+      std::printf("Read data encoded: %s, sending to UDP broadcast\r\n", std::string(reinterpret_cast<char *>(enc_buf), encrypted_size).c_str());
+
+      // Send to UDP broadcast
+      if ((rc = ::sendto(sock_fd, enc_buf, encrypted_size, 0, reinterpret_cast<struct sockaddr *>(&broadcast_addr), sizeof(struct sockaddr_in))) < 0) {
+        std::fprintf(stderr, "Error sendto(): %s (%s:%i)\r\n", ::strerror(errno), __FILE__, __LINE__);
+        ::close(sock_fd);
+        goto error;
+      }
+
       std::memset(read_buf, '\0', sizeof(read_buf));
       std::free(enc_buf);
     } else {
@@ -168,6 +203,8 @@ int32_t main(int32_t argc, char *argv[]) {
   }
 
 exit:
+  ::close(sp_fd);
+  ::close(sock_fd);
   return 0;
 
 error:
